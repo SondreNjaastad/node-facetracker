@@ -282,6 +282,43 @@ function stopCamera() {
     });
 }
 
+function setZoom(zoomPosition) {
+    if (!ENABLE_CAMERA_CONTROL || !config.cameraControl.autoZoom.enabled) {
+        console.log(`Zoom control disabled. Would send: zoom=${zoomPosition}`);
+        return;
+    }
+    
+    const url = `http://${CAMERA_IP}/ctrl/set?lens_zoom_pos=${zoomPosition}`;
+    http.get(url, (res) => {
+        // Optionally handle response
+        res.resume();
+    }).on('error', (e) => {
+        console.error(`Camera zoom command error: ${e.message}`);
+    });
+}
+
+function calculateZoom(faceWidth, currentZoom) {
+    const { autoZoom } = config.cameraControl;
+    const targetWidth = autoZoom.targetFaceWidth;
+    const widthDiff = faceWidth - targetWidth;
+    
+    // Only zoom if difference is significant
+    if (Math.abs(widthDiff) < autoZoom.zoomDeadZone) {
+        return null; // No zoom needed
+    }
+    
+    // Calculate zoom direction and amount
+    // If face is too small (widthDiff < 0), zoom IN (increase zoom position)
+    // If face is too large (widthDiff > 0), zoom OUT (decrease zoom position)
+    const zoomDirection = widthDiff < 0 ? 1 : -1; // Negative widthDiff = zoom in, positive = zoom out
+    const zoomAmount = Math.abs(widthDiff) * autoZoom.zoomGain;
+    
+    // Calculate new zoom position
+    const newZoom = Math.max(autoZoom.minZoom, Math.min(autoZoom.maxZoom, currentZoom + (zoomDirection * zoomAmount)));
+    
+    return newZoom;
+}
+
 function calculatePanTilt(face, frameWidth, frameHeight) {
     const centerX = frameWidth / 2;
     const centerY = frameHeight / 2;
@@ -357,6 +394,7 @@ function startCapture(size, fps, pixfmt, onFail) {
 
   let accum = Buffer.alloc(0);
   let opened = false, failed = false, busy = false, frameId = 0;
+  let currentZoom = 2000; // Track current zoom position (start at middle)
 
   ff.stderr.on("data", (d) => {
     const s = d.toString(); process.stderr.write(s);
@@ -390,8 +428,11 @@ function startCapture(size, fps, pixfmt, onFail) {
 
       addon.detectAndRecognizeAsync(frameCopy, W, H, W * 4, "rgba")
         .then((res) => {
+          // Filter detections by confidence threshold
+          const filteredRes = res.filter(d => d.score >= config.tracking.confidenceThreshold);
+          
           // track + draw
-          const dets = tracker.update(res.map(d => ({ box: d.box, score: d.score })));
+          const dets = tracker.update(filteredRes.map(d => ({ box: d.box, score: d.score })));
           
           // Draw center crosshair
           drawCenterCrosshair(frameCopy, W, H);
@@ -421,6 +462,22 @@ function startCapture(size, fps, pixfmt, onFail) {
             
             // Send tracking commands
             trackFace(largestFace, W, H);
+            
+            // Auto zoom control
+            if (config.cameraControl.autoZoom.enabled) {
+              const newZoom = calculateZoom(largestFace.w, currentZoom);
+              if (newZoom !== null && newZoom !== currentZoom) {
+                setZoom(newZoom);
+                currentZoom = newZoom;
+                console.log(`Zoom: ${currentZoom} (face width: ${largestFace.w}, target: ${config.cameraControl.autoZoom.targetFaceWidth})`);
+              }
+            }
+          } else {
+            // No faces detected - stop the camera
+            if (ENABLE_CAMERA_CONTROL) {
+              stopCamera();
+              console.log("No faces detected - stopping camera");
+            }
           }
           
           if (SHOW_VIEWER && viewer && !viewer.killed && !viewer.stdin.destroyed) {
@@ -428,7 +485,11 @@ function startCapture(size, fps, pixfmt, onFail) {
           }
           
           if (id % fps === 0) {
-            console.log(`[${size} @ ${fps}fps ${pixfmt}] Frame ${id}: ${res.length} face(s)`);
+            console.log(`[${size} @ ${fps}fps ${pixfmt}] Frame ${id}: ${res.length} detected, ${filteredRes.length} above threshold (${config.tracking.confidenceThreshold})`);
+            if (res.length > 0) {
+              const scores = res.map(d => d.score.toFixed(2));
+              console.log(`  Confidence scores: [${scores.join(', ')}]`);
+            }
           }
         })
         .catch((err) => console.error("detect error:", err))
@@ -467,6 +528,8 @@ module.exports = {
   calculatePanTilt, 
   sendCameraCommand,
   stopCamera,
+  setZoom,
+  calculateZoom,
   TinyTracker,
   drawRectRGBA,
   drawCenterCrosshair,
